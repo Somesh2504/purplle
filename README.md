@@ -9,16 +9,21 @@ An end-to-end AI-powered retail analytics system that processes CCTV footage to 
 
 | Tool | Version |
 |---|---|
-| Docker | 24.x+ |
-| Docker Compose | 2.x+ (plugin syntax: `docker compose`) |
+| OS | Windows 10/11 (PowerShell) |
+| Node.js | v20.x+ |
+| Python | v3.10+ |
+| Database | MongoDB Atlas (Cloud) |
 | Free RAM | ≥ 4 GB recommended |
-| CPU | Any x86-64; GPU not required |
 
 ---
 
-## Quick Start
+## Quick Start (Native Windows Setup)
+
+We have transitioned away from Docker to provide a faster, native execution environment on Windows using PowerShell. 
 
 ### 1. Clone and place data files
+
+Ensure your `data` folder is structured as follows at the project root:
 
 ```
 purplle-tech-challenge/
@@ -31,62 +36,63 @@ purplle-tech-challenge/
     └── Brigade_Bangalore_10_April_26.csv
 ```
 
-> The `data/` directory is mounted read-only into both services at runtime. No data files are baked into the Docker images.
+### 2. Configure MongoDB Atlas & Whitelist your IP
 
-### 2. Start the system
+The system uses a cloud-hosted MongoDB Atlas cluster for data persistence. 
+**Crucial Step:** MongoDB Atlas blocks unauthorized IPs by default. You must whitelist your IP address before running the system.
 
-```bash
-docker compose up --build
+1. Log into your [MongoDB Atlas dashboard](https://cloud.mongodb.com/).
+2. On the left sidebar, under **Security**, click **Network Access**.
+3. Click the **+ ADD IP ADDRESS** button.
+4. Click **ALLOW ACCESS FROM ANYWHERE** (this will fill in `0.0.0.0/0`) or add your current IP.
+5. Click **Confirm** and wait ~30 seconds for the status to turn "Active".
+
+### 3. Install Dependencies
+
+Open PowerShell and run the setup script to install all Node and Python dependencies:
+
+```powershell
+.\setup.ps1
 ```
 
-On first run, the build step will:
-- Install all Node.js dependencies inside the backend image
-- Install all Python dependencies inside the cv-pipeline image
-- **Pre-download YOLOv8n weights** (`yolov8n.pt`) into the cv-pipeline image
+### 4. Start the system
 
-Subsequent runs reuse the cached layers and start in seconds.
+Run the main orchestration script:
 
-### 3. Verify the system is running
+```powershell
+.\start_system.ps1
+```
 
-```bash
-# Health check (should return 200 OK with status: "ok")
-curl http://localhost:3000/api/health
+This script will:
+- Boot up the Node.js backend on port 3000.
+- Wait for it to connect to MongoDB Atlas and become healthy.
+- Launch the Python CV pipeline to begin analyzing the videos and pushing events.
+
+### 5. Verify the system is running
+
+Open a **new** PowerShell window and test the endpoints:
+
+```powershell
+# Health check (should return 200 OK with database: "connected")
+curl.exe http://localhost:3000/api/health
 
 # Store KPIs
-curl http://localhost:3000/api/metrics
+curl.exe http://localhost:3000/api/metrics
 
 # Shopping funnel
-curl http://localhost:3000/api/funnel
+curl.exe http://localhost:3000/api/funnel
 ```
 
-### 4. Watch live logs
+### 6. Stop
 
-```bash
-# All services
-docker compose logs -f
-
-# Backend only
-docker compose logs -f backend
-
-# CV pipeline only
-docker compose logs -f cv-pipeline
-```
-
-### 5. Stop
-
-```bash
-docker compose down
-
-# To also wipe the MongoDB volume (resets all session data)
-docker compose down -v
-```
+To stop all services, simply press **ENTER** in the terminal running `start_system.ps1`, or press `Ctrl+C`.
 
 ---
 
 ## Architecture Overview
 
 ```
-cv-pipeline (Python)  ──POST /api/events──▶  backend (Node.js)  ──▶  MongoDB
+cv-pipeline (Python)  ──POST /api/events──▶  backend (Node.js)  ──▶  MongoDB Atlas
      │                                              │
      │ reads                                        │ reads
      ▼                                              ▼
@@ -198,15 +204,13 @@ Store-level KPIs for the evaluation day.
 
 ## Configuration
 
-All configuration is handled via environment variables set in `docker-compose.yml`. No `.env` file is required.
+Configuration is handled via the `.env` file in the `backend/` directory and variables inside the Python scripts.
 
-| Variable | Service | Default | Description |
-|---|---|---|---|
-| `MONGO_URI` | backend | `mongodb://mongodb:27017/store_analytics` | MongoDB connection string |
-| `PORT` | backend | `3000` | HTTP port |
-| `NODE_ENV` | backend | `production` | Runtime environment |
-| `BACKEND_URL` | cv-pipeline | `http://backend:3000` | Backend webhook target |
-| `DATA_DIR` | cv-pipeline | `/app/data` | Path to data mount |
+| Variable | File | Description |
+|---|---|---|
+| `MONGO_URI` | `backend/.env` | MongoDB Atlas connection string |
+| `PORT` | `backend/.env` | HTTP port (default: 3000) |
+| `BACKEND_URL` | `cv-pipeline/tracker.py` | Webhook target (default: http://localhost:3000) |
 
 ---
 
@@ -214,13 +218,14 @@ All configuration is handled via environment variables set in `docker-compose.ym
 
 ```
 purplle-tech-challenge/
-├── docker-compose.yml          # Service orchestration
+├── setup.ps1                   # Dependency installation script
+├── start_system.ps1            # Main execution orchestrator
 ├── DESIGN.md                   # Architecture document
 ├── CHOICES.md                  # Engineering decisions
 ├── README.md                   # This file
 ├── .gitignore
 │
-├── data/                       # ← Mount point (not in git)
+├── data/                       # ← Required dataset directory
 │   ├── videos/
 │   │   ├── entry_cam.mp4
 │   │   ├── zone_1.mp4
@@ -229,9 +234,9 @@ purplle-tech-challenge/
 │   └── Brigade_Bangalore_10_April_26.csv
 │
 ├── backend/
-│   ├── Dockerfile
+│   ├── .env                    # Environment variables
 │   ├── package.json
-│   ├── server.js               # Express app + DB retry loop
+│   ├── server.js               # Express app + DB connection
 │   ├── models/
 │   │   └── Session.js          # Mongoose schema
 │   ├── controllers/
@@ -243,7 +248,6 @@ purplle-tech-challenge/
 │       └── funnel.js
 │
 └── cv-pipeline/
-    ├── Dockerfile
     ├── requirements.txt
     └── tracker.py              # YOLO + spatial logic + webhooks
 ```
@@ -252,17 +256,14 @@ purplle-tech-challenge/
 
 ## Troubleshooting
 
-**`cv-pipeline` exits immediately with "Missing video files"**
-→ Ensure all 4 `.mp4` files are placed in `data/videos/` before running `docker compose up`.
+**`cv-pipeline` crashes or throws missing file errors**
+→ Ensure all 4 `.mp4` files are placed in `data/videos/` and the `.csv` file is in `data/`.
 
-**`backend` keeps printing "MongoDB not ready — retrying"**
-→ Normal during startup. MongoDB takes 10–20 seconds to initialise on first run. The backend retries up to 10 times. Wait for the healthcheck to pass.
+**`backend` keeps printing "MongoDB not ready — retrying" or throws TLS/SSL errors**
+→ This means your IP address is not whitelisted in MongoDB Atlas. Go to the Atlas dashboard, under Network Access, and add `0.0.0.0/0`.
 
-**`docker compose up` fails with "port 3000 already in use"**
-→ Another process is using port 3000. Run `docker compose down` and check for orphan containers with `docker ps`.
+**The startup script fails with "port 3000 already in use"**
+→ Another process is using port 3000. Run `Stop-Process -Name node -Force` to clear any orphaned background backend instances.
 
-**Want to reprocess videos from scratch (reset all sessions)**
-```bash
-docker compose down -v    # removes MongoDB volume
-docker compose up
-```
+**Metrics API returns `POS CSV not found`**
+→ Make sure the CSV file is named exactly `Brigade_Bangalore_10_April_26.csv` and is placed in the `data/` directory, not `backend/data/`.

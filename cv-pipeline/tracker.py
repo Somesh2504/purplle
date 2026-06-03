@@ -35,9 +35,9 @@ from ultralytics import YOLO
 
 load_dotenv()
 
-BACKEND_URL = os.getenv("BACKEND_URL", "http://backend:3000")
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:3000")
 EVENTS_ENDPOINT = f"{BACKEND_URL}/api/events"
-DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
+DATA_DIR = Path(os.getenv("DATA_DIR", str(Path(__file__).resolve().parent.parent / "data")))
 VIDEOS_DIR = DATA_DIR / "videos"
 
 # Inference runs on 1 out of every FRAME_SKIP frames

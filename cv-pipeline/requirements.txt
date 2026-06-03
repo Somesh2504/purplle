@@ -1,15 +1,20 @@
-# ─── Computer Vision ───────────────────────────────
-# YOLOv8 Nano inference + built-in ByteTrack tracker
-ultralytics==8.2.48
+# ─── CPU-only PyTorch (avoids 3GB+ CUDA download) ─────────────────
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+torchvision
 
-# Headless OpenCV — no GUI dependencies, safe inside Docker
-opencv-python-headless==4.10.0.84
+# ─── Computer Vision ────────────────────────────────────────────────
+# Use latest ultralytics — supports Python 3.12+/3.14
+ultralytics
 
-# ─── Networking ────────────────────────────────────
+# Headless OpenCV — no GUI window dependencies
+opencv-python-headless
+
+# ─── Networking ─────────────────────────────────────────────────────
 requests==2.32.3
 
-# ─── Config ────────────────────────────────────────
+# ─── Config ─────────────────────────────────────────────────────────
 python-dotenv==1.0.1
 
-# ─── Numerics (pulled transitively, pinned for stability) ─
-numpy==1.26.4
+# ─── Numerics ───────────────────────────────────────────────────────
+numpy

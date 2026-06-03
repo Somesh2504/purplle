@@ -2,6 +2,11 @@
 
 require("dotenv").config();
 
+// Force Google public DNS so MongoDB Atlas SRV records resolve correctly
+// on Windows machines where the system DNS blocks SRV lookups.
+const dns = require("dns");
+dns.setServers(["8.8.8.8", "8.8.4.4", "1.1.1.1"]);
+
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
@@ -23,6 +28,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use(express.static("public"));
 
 // Structured request logger
 app.use((req, _res, next) => {
@@ -50,8 +56,10 @@ app.get("/api/health", (_req, res) => {
   ];
   const isHealthy = dbState === 1;
 
-  res.status(isHealthy ? 200 : 503).json({
-    status: isHealthy ? "ok" : "degraded",
+  // Always return 200 so startup scripts and load balancers can detect
+  // that the HTTP server is alive even while DB is still connecting.
+  res.status(200).json({
+    status: isHealthy ? "ok" : "starting",
     service: "store-intelligence-backend",
     timestamp: new Date().toISOString(),
     database: dbStatus,
@@ -114,8 +122,9 @@ async function connectWithRetry(attempt = 1) {
     );
 
     await mongoose.connect(MONGO_URI, {
-      serverSelectionTimeoutMS: 4000, // fail fast per attempt
+      serverSelectionTimeoutMS: 15000, // give Atlas more time for DNS+TLS
       socketTimeoutMS: 45000,
+      family: 4,               // force IPv4 — avoids IPv6 DNS issues on Windows
     });
 
     console.log(

@@ -29,6 +29,7 @@ const Session = require("../models/Session");
 // and during local development (node server.js from /backend).
 const CSV_PATH = path.resolve(
   process.cwd(),
+  "..",
   "data",
   "Brigade_Bangalore_10_April_26.csv"
 );
