@@ -1,0 +1,32 @@
+# Python cache — never needed inside the image
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments — the image uses pip install, not a venv
+.venv/
+venv/
+env/
+
+# YOLO run artifacts (generated during local testing)
+runs/
+
+# Local test data — videos are mounted as a Docker volume at runtime,
+# never baked into the image
+data/
+
+# Logs
+*.log
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Git
+.git/
+.gitignore

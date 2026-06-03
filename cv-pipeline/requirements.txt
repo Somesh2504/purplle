@@ -1,0 +1,15 @@
+# ─── Computer Vision ───────────────────────────────
+# YOLOv8 Nano inference + built-in ByteTrack tracker
+ultralytics==8.2.48
+
+# Headless OpenCV — no GUI dependencies, safe inside Docker
+opencv-python-headless==4.10.0.84
+
+# ─── Networking ────────────────────────────────────
+requests==2.32.3
+
+# ─── Config ────────────────────────────────────────
+python-dotenv==1.0.1
+
+# ─── Numerics (pulled transitively, pinned for stability) ─
+numpy==1.26.4

@@ -1,0 +1,76 @@
+version: "3.9"
+
+services:
+  # ─────────────────────────────────────────────
+  # SERVICE 1: MongoDB — persistent store
+  # ─────────────────────────────────────────────
+  mongodb:
+    image: mongo:7.0
+    container_name: store_mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - store_net
+
+  # ─────────────────────────────────────────────
+  # SERVICE 2: Node.js Backend — the state machine / brain
+  # ─────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: store_backend
+    restart: on-failure
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - MONGO_URI=mongodb://mongodb:27017/store_analytics
+      - PORT=3000
+    volumes:
+      # Mount data read-only so backend can ingest the POS CSV
+      - ./data:/app/data:ro
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    networks:
+      - store_net
+
+  # ─────────────────────────────────────────────
+  # SERVICE 3: Python CV Pipeline — dumb event emitter
+  # ─────────────────────────────────────────────
+  cv-pipeline:
+    build:
+      context: ./cv-pipeline
+      dockerfile: Dockerfile
+    container_name: store_cv_pipeline
+    restart: on-failure
+    environment:
+      - BACKEND_URL=http://backend:3000
+    volumes:
+      # Mount data read-only so pipeline can access videos and CSV
+      - ./data:/app/data:ro
+    depends_on:
+      - backend
+    networks:
+      - store_net
+
+# ─────────────────────────────────────────────
+# VOLUMES & NETWORKS
+# ─────────────────────────────────────────────
+volumes:
+  mongo_data:
+    driver: local
+
+networks:
+  store_net:
+    driver: bridge
