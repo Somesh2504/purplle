@@ -37,8 +37,14 @@ load_dotenv()
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:3000")
 EVENTS_ENDPOINT = f"{BACKEND_URL}/api/events"
+SESSION_ENDPOINT = f"{BACKEND_URL}/api/session"
 DATA_DIR = Path(os.getenv("DATA_DIR", str(Path(__file__).resolve().parent.parent / "data")))
 VIDEOS_DIR = DATA_DIR / "videos"
+
+# ── Global run session ID (fetched from backend on startup) ───────────────────
+# This is the server-generated ID that scopes all events to the current live run.
+# Old data from previous runs in MongoDB will NOT appear on the dashboard.
+RUN_SESSION_ID: str = "unknown"
 
 # Inference runs on 1 out of every FRAME_SKIP frames
 FRAME_SKIP = 5
@@ -75,8 +81,9 @@ def log(level: str, message: str, **kwargs):
 def fire_event(event_type: str, track_id: int, camera_id: str, zone_name: str):
     """
     Send a single atomic event webhook to the backend.
+    Includes run_session_id so the backend can scope this event to the
+    current live session (not mixed with historical data).
     Completely swallows network errors so the CV loop is never interrupted.
-    Runs synchronously but with a hard timeout so it can't stall the loop.
     """
     payload = {
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
@@ -84,6 +91,7 @@ def fire_event(event_type: str, track_id: int, camera_id: str, zone_name: str):
         "track_id": int(track_id),
         "camera_id": camera_id,
         "zone_name": zone_name,
+        "run_session_id": RUN_SESSION_ID,
     }
     try:
         response = requests.post(
@@ -171,8 +179,20 @@ def process_entry_cam(model: YOLO, video_path: Path):
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # Virtual line Y coordinate — 55 % down the frame height
-    LINE_Y = int(frame_h * 0.55)
+    # Check for custom drawn line configuration
+    config_path = DATA_DIR / "camera_config.json"
+    y_pct = 0.55  # Default
+    if config_path.exists():
+        try:
+            with open(config_path, "r") as f:
+                config = json.load(f)
+                if "entry_cam" in config and "line_y_pct" in config["entry_cam"]:
+                    y_pct = config["entry_cam"]["line_y_pct"]
+                    log("info", "Loaded custom tripwire config", camera_id=camera_id, y_pct=y_pct)
+        except Exception as e:
+            log("warn", "Failed to load camera_config.json", error=str(e))
+            
+    LINE_Y = int(frame_h * y_pct)
 
     log("info", "Worker started", camera_id=camera_id,
         resolution=f"{frame_w}x{frame_h}", total_frames=total_frames, line_y=LINE_Y)
@@ -452,6 +472,33 @@ def process_billing_cam(model: YOLO, video_path: Path):
 # Startup Readiness Check
 # ──────────────────────────────────────────────────────────────────────────────
 
+def fetch_session_id(max_retries: int = 15, delay: float = 5.0) -> str:
+    """
+    Fetch the current run session_id from the backend.
+    This is generated fresh every time the backend boots, so it scopes
+    all CV events to this exact live session only.
+    """
+    global RUN_SESSION_ID
+    session_url = SESSION_ENDPOINT
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = requests.get(session_url, timeout=3)
+            if r.status_code == 200:
+                data = r.json()
+                RUN_SESSION_ID = data.get("session_id", "unknown")
+                log("info", "Fetched run session_id from backend",
+                    attempt=attempt, session_id=RUN_SESSION_ID)
+                return RUN_SESSION_ID
+        except Exception:  # noqa: BLE001
+            pass
+        log("warn", "Could not fetch session_id — retrying",
+            attempt=attempt, max_retries=max_retries, retry_in_sec=delay)
+        time.sleep(delay)
+
+    log("warn", "Could not fetch session_id after retries — using fallback")
+    return RUN_SESSION_ID
+
+
 def wait_for_backend(max_retries: int = 15, delay: float = 5.0):
     """
     Poll /api/health until the backend is ready before starting CV processing.
@@ -513,8 +560,12 @@ def main():
         frame_skip=FRAME_SKIP,
         dwell_threshold_frames=DWELL_THRESHOLD_FRAMES)
 
-    # ── Wait for backend to be healthy ────────────────
+    # ── Wait for backend to be healthy ──────────────────
     wait_for_backend()
+
+    # ── Fetch run session_id (must happen after backend is healthy) ─────
+    fetch_session_id()
+    log("info", "CV pipeline scoped to session", session_id=RUN_SESSION_ID)
 
     # ── Verify video files exist ───────────────────────
     video_map = {

@@ -137,19 +137,21 @@ async function getMetrics(req, res) {
   try {
     log("info", "GET /api/metrics — computing store KPIs");
 
+    // Scope all queries to the current live session only
+    const runSessionId = req.app.locals.session_id;
+
     // ── Parallel I/O ───────────────────────────────────────────────────────
-    const [csvData, sessionStats] = await Promise.all([
+    const [csvData, sessionStats, buyingUnitAgg] = await Promise.all([
       // 1. Parse POS CSV for ground-truth purchase count
       parsePOSCsv(),
 
-      // 2. MongoDB aggregation — consumer sessions only (is_staff: false)
+      // 2. MongoDB aggregation — raw session stats (all consumer sessions)
       Session.aggregate([
-        { $match: { is_staff: false } },
+        { $match: { is_staff: false, run_session_id: runSessionId } },
         {
           $group: {
             _id: null,
             total_sessions: { $sum: 1 },
-            // Average dwell: compute ms between start and end (or now if active)
             avg_dwell_ms: {
               $avg: {
                 $subtract: [
@@ -164,9 +166,39 @@ async function getMetrics(req, res) {
             completed_sessions: {
               $sum: { $cond: [{ $eq: ["$status", "completed"] }, 1, 0] },
             },
-            group_visits: {
+            group_sessions: {
               $sum: { $cond: [{ $ne: ["$group_id", null] }, 1, 0] },
             },
+          },
+        },
+      ]),
+
+      // 3. Buying Unit aggregation — the correct denominator for conversion rate.
+      //
+      //    A "Buying Unit" is defined as:
+      //      - Every unique group_id counts as ONE unit (a family/friends group)
+      //      - Every session with group_id = null counts as ONE unit (solo shopper)
+      //
+      //    We use $facet to compute both in a single DB round-trip:
+      //      Branch A: count sessions where group_id is null (solo shoppers)
+      //      Branch B: count distinct group_ids (group walk-ins)
+      //    Total Buying Units = A + B
+      //
+      Session.aggregate([
+        { $match: { is_staff: false, run_session_id: runSessionId } },
+        {
+          $facet: {
+            // Branch A: solo shoppers (no group)
+            solo: [
+              { $match: { group_id: null } },
+              { $count: "count" },
+            ],
+            // Branch B: distinct group_ids
+            groups: [
+              { $match: { group_id: { $ne: null } } },
+              { $group: { _id: "$group_id" } },
+              { $count: "count" },
+            ],
           },
         },
       ]),
@@ -180,8 +212,17 @@ async function getMetrics(req, res) {
       avg_dwell_ms: 0,
       active_sessions: 0,
       completed_sessions: 0,
-      group_visits: 0,
+      group_sessions: 0,
     };
+
+    // Buying Unit math
+    const buAgg = buyingUnitAgg[0] || { solo: [], groups: [] };
+    const soloUnits  = buAgg.solo[0]?.count   || 0;
+    const groupUnits = buAgg.groups[0]?.count  || 0;
+    const totalBuyingUnits = soloUnits + groupUnits;
+
+    // Count unique groups (for display)
+    const uniqueGroupCount = groupUnits;
 
     const totalConsumerSessions = stats.total_sessions;
     const avgDwellMinutes =
@@ -189,13 +230,14 @@ async function getMetrics(req, res) {
         ? Math.round(stats.avg_dwell_ms / 60000)
         : 0;
 
-    // ── Conversion Rate ────────────────────────────────────────────────────
-    // Guard against division by zero if no sessions have been recorded yet
-    // (e.g. CV pipeline hasn't started, or system just booted).
+    // ── Conversion Rate (using Buying Units as denominator) ─────────────
+    // This is the KEY insight: a family of 4 walking in together is ONE
+    // buying unit, not four. So the denominator is totalBuyingUnits, not
+    // totalConsumerSessions.
     const conversionRate =
-      totalConsumerSessions > 0
+      totalBuyingUnits > 0
         ? parseFloat(
-            ((unique_invoice_count / totalConsumerSessions) * 100).toFixed(2)
+            ((unique_invoice_count / totalBuyingUnits) * 100).toFixed(2)
           )
         : 0;
 
@@ -204,18 +246,18 @@ async function getMetrics(req, res) {
     let anomaly_reason = null;
 
     if (
-      totalConsumerSessions > ANOMALY_SESSION_FLOOR &&
+      totalBuyingUnits > ANOMALY_SESSION_FLOOR &&
       conversionRate < ANOMALY_RATE_CEILING
     ) {
       anomaly_detected = true;
       anomaly_reason =
-        `High footfall (${totalConsumerSessions} sessions) but very low conversion ` +
+        `High footfall (${totalBuyingUnits} buying units) but very low conversion ` +
         `rate (${conversionRate}%). Possible causes: checkout bottleneck, ` +
         `camera tracking failures on entry_cam, or billing events not firing ` +
         `correctly. Recommend reviewing entry_cam coverage and billing counter logs.`;
 
       log("warn", "Anomaly detected in metrics", {
-        total_sessions: totalConsumerSessions,
+        buying_units: totalBuyingUnits,
         conversion_rate: conversionRate,
         unique_invoices: unique_invoice_count,
       });
@@ -229,7 +271,13 @@ async function getMetrics(req, res) {
       total_consumer_sessions: totalConsumerSessions,
       active_sessions: stats.active_sessions,
       completed_sessions: stats.completed_sessions,
-      group_visits: stats.group_visits,
+      // --- Group data ---
+      total_buying_units: totalBuyingUnits,
+      solo_walk_ins: soloUnits,
+      group_walk_ins: groupUnits,
+      unique_groups: uniqueGroupCount,
+      group_sessions: stats.group_sessions,
+      // --- Dwell ---
       avg_dwell_time_min: avgDwellMinutes,
       // --- POS data (ground truth) ---
       total_unique_invoices: unique_invoice_count,
@@ -260,10 +308,10 @@ async function getMetrics(req, res) {
  * ───────────
  * Builds a 4-level shopping funnel using MongoDB aggregation + CSV data.
  *
- * Funnel levels:
- *   L1 Walk-ins          → all consumer sessions (is_staff: false)
- *   L2 Browsing          → sessions with ≥1 zone_dwell timeline entry
- *   L3 Checkout Ready    → sessions with ≥1 billing_queue timeline entry
+ * Funnel levels (all use "Buying Units" — groups count as 1):
+ *   L1 Walk-ins          → total buying units (solo + unique groups)
+ *   L2 Browsing          → buying units with ≥1 zone_dwell timeline entry
+ *   L3 Checkout Ready    → buying units with ≥1 billing_queue timeline entry
  *   L4 Completed Purchase → unique invoices from POS CSV
  *
  * Design decision — why we use $filter + $gt 0 instead of $unwind:
@@ -275,69 +323,91 @@ async function getFunnel(req, res) {
   try {
     log("info", "GET /api/funnel — computing shopping funnel");
 
+    // Scope all queries to the current live session only
+    const runSessionId = req.app.locals.session_id;
+
     // ── Parallel I/O ───────────────────────────────────────────────────────
-    const [csvData, funnelAgg] = await Promise.all([
+    const [csvData, funnelAgg, buyingUnitAgg] = await Promise.all([
       parsePOSCsv(),
 
       Session.aggregate([
-        // Only consumer sessions — exclude staff
-        { $match: { is_staff: false } },
+        // Current session only — exclude staff
+        { $match: { is_staff: false, run_session_id: runSessionId } },
+        {
+          // Add computed boolean flags per session
+          $addFields: {
+            has_zone_dwell: {
+              $gt: [
+                {
+                  $size: {
+                    $filter: {
+                      input: "$timeline",
+                      as: "evt",
+                      cond: { $eq: ["$$evt.event_type", "zone_dwell"] },
+                    },
+                  },
+                },
+                0,
+              ],
+            },
+            has_billing: {
+              $gt: [
+                {
+                  $size: {
+                    $filter: {
+                      input: "$timeline",
+                      as: "evt",
+                      cond: { $eq: ["$$evt.event_type", "billing_queue"] },
+                    },
+                  },
+                },
+                0,
+              ],
+            },
+            // Assign a "buying unit key" — group_id if present, else session_id
+            buying_unit_key: {
+              $ifNull: ["$group_id", "$session_id"],
+            },
+          },
+        },
+        {
+          // Group by buying unit key to collapse group members into one row
+          $group: {
+            _id: "$buying_unit_key",
+            // A buying unit "browsed" if ANY member browsed
+            has_zone_dwell: { $max: "$has_zone_dwell" },
+            // A buying unit "was at billing" if ANY member was
+            has_billing: { $max: "$has_billing" },
+          },
+        },
         {
           $group: {
             _id: null,
-
-            // L1: total walk-ins = all consumer sessions
             l1_walk_ins: { $sum: 1 },
-
-            // L2: sessions with at least one zone_dwell event in timeline
             l2_browsing: {
-              $sum: {
-                $cond: [
-                  {
-                    $gt: [
-                      {
-                        $size: {
-                          $filter: {
-                            input: "$timeline",
-                            as: "evt",
-                            cond: { $eq: ["$$evt.event_type", "zone_dwell"] },
-                          },
-                        },
-                      },
-                      0,
-                    ],
-                  },
-                  1,
-                  0,
-                ],
-              },
+              $sum: { $cond: ["$has_zone_dwell", 1, 0] },
             },
-
-            // L3: sessions with at least one billing_queue event in timeline
             l3_checkout_ready: {
-              $sum: {
-                $cond: [
-                  {
-                    $gt: [
-                      {
-                        $size: {
-                          $filter: {
-                            input: "$timeline",
-                            as: "evt",
-                            cond: {
-                              $eq: ["$$evt.event_type", "billing_queue"],
-                            },
-                          },
-                        },
-                      },
-                      0,
-                    ],
-                  },
-                  1,
-                  0,
-                ],
-              },
+              $sum: { $cond: ["$has_billing", 1, 0] },
             },
+          },
+        },
+      ]),
+
+      // Separate buying unit count (for consistency with metrics endpoint)
+      Session.aggregate([
+        { $match: { is_staff: false, run_session_id: runSessionId } },
+        {
+          $facet: {
+            solo: [
+              { $match: { group_id: null } },
+              { $count: "count" },
+            ],
+            groups: [
+              { $match: { group_id: { $ne: null } } },
+              { $group: { _id: "$group_id" } },
+              { $count: "count" },
+            ],
           },
         },
       ]),
@@ -350,12 +420,17 @@ async function getFunnel(req, res) {
       l3_checkout_ready: 0,
     };
 
-    const l1 = agg.l1_walk_ins;
+    const buAgg = buyingUnitAgg[0] || { solo: [], groups: [] };
+    const soloUnits  = buAgg.solo[0]?.count   || 0;
+    const groupUnits = buAgg.groups[0]?.count  || 0;
+    const totalRawSessions = soloUnits + groupUnits;
+
+    const l1 = agg.l1_walk_ins;  // buying units
     const l2 = agg.l2_browsing;
     const l3 = agg.l3_checkout_ready;
     const l4 = csvData.unique_invoice_count;
 
-    // pct_of_top: each stage as a % of L1 (walk-ins), capped at 100%
+    // pct_of_top: each stage as a % of L1 (buying units), capped at 100%
     const pct = (n) => (l1 > 0 ? parseFloat(((n / l1) * 100).toFixed(1)) : 0);
 
     // Drop-off: how many were lost between consecutive stages
@@ -369,7 +444,7 @@ async function getFunnel(req, res) {
         {
           level: 1,
           stage: "walk_in",
-          label: "Total Walk-ins",
+          label: "Total Walk-ins (Buying Units)",
           count: l1,
           pct_of_top: 100,
           drop_off_from_prev: 0,
@@ -400,7 +475,9 @@ async function getFunnel(req, res) {
         },
       ],
       summary: {
-        total_walk_ins: l1,
+        total_buying_units: l1,
+        solo_walk_ins: soloUnits,
+        group_walk_ins: groupUnits,
         total_converted: l4,
         overall_conversion_rate_pct:
           l1 > 0 ? parseFloat(((l4 / l1) * 100).toFixed(2)) : 0,

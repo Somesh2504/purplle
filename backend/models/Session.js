@@ -61,6 +61,14 @@ const sessionSchema = new mongoose.Schema(
       index: true,
     },
 
+    // Multi-store architecture: identifies which physical store this
+    // session belongs to. Defaults to "store_1" for single-store demo.
+    store_id: {
+      type: String,
+      default: "store_1",
+      index: true,
+    },
+
     // The YOLO track_id from the first "entry" event on entry_cam.
     // Used as the primary lookup key for re-entry stitching.
     primary_track_id: {
@@ -94,9 +102,19 @@ const sessionSchema = new mongoose.Schema(
       index: true,
     },
 
-    // Stamped when ≥3 entries arrive within 1.5 s of each other.
-    // All members of the group share the same group_id string.
+    // Group walk-in detection: when ≥2 entries arrive at the same
+    // store + camera within a 2-second window, they share a group_id.
+    // Used for "Buying Unit" math — a group counts as ONE buying unit.
     group_id: {
+      type: String,
+      default: null,
+      index: true,
+    },
+
+    // Server-generated session ID that scopes data to a single
+    // backend run. Prevents historical data from leaking into the
+    // live dashboard. Generated fresh on every backend boot.
+    run_session_id: {
       type: String,
       default: null,
       index: true,
@@ -119,8 +137,12 @@ const sessionSchema = new mongoose.Schema(
 // for a given track_id sorted by most-recent first.
 sessionSchema.index({ primary_track_id: 1, status: 1, end_time: -1 });
 
-// Used by the group detection query: find sessions started within a time window
-sessionSchema.index({ start_time: 1, status: 1 });
+// Used by the group detection query: find sessions created at the same store
+// and camera within the 2-second temporal window.
+sessionSchema.index({ store_id: 1, run_session_id: 1, start_time: -1 });
+
+// Used by buying-unit aggregation: count distinct group_ids
+sessionSchema.index({ is_staff: 1, run_session_id: 1, group_id: 1 });
 
 // ─── Virtual: dwell_duration_minutes ─────────────────────────────────────────
 sessionSchema.virtual("dwell_duration_minutes").get(function () {
@@ -157,7 +179,7 @@ sessionSchema.methods.checkStaffHeuristic = function () {
     (e) => e.event_type === "zone_dwell" || e.event_type === "billing_queue"
   ).length;
 
-  const likelyStaff = durationMinutes > 240 || zoneEventCount > 15;
+  const likelyStaff = durationMinutes > 240 || zoneEventCount > 50;
 
   if (likelyStaff && !this.is_staff) {
     this.is_staff = true;

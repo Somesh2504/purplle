@@ -10,13 +10,22 @@
  * is intentionally kept "dumb" and fires individual events without any
  * cross-camera or cross-time awareness.
  *
+ * WebSocket Push:
+ *   After every DB write, we emit a 'live_event' via Socket.io so the
+ *   dashboard updates instantly without any polling delay.
+ *
+ * Session Scoping:
+ *   Every session and event is tagged with the server's session_id so
+ *   the dashboard only sees data from the current live run.
+ *
  * Business rules implemented:
  *   A. Re-Entry Stitching    — reopens a recently-closed session instead of
  *                              creating a duplicate walk-in count.
  *   B. Timeline Enrichment   — zone_dwell / billing_queue appended to the
  *                              most recent active session.
- *   C. Group Detection       — ≥3 entries within 1.5 s → shared group_id.
- *   D. Staff Heuristic       — >4 h dwell OR >15 zone events → is_staff=true.
+ *   C. Group Detection       — ≥2 entries within 2.0 s on same store+camera
+ *                              → shared group_id ("Buying Unit").
+ *   D. Staff Heuristic       — >4 h dwell OR >50 zone events → is_staff=true.
  */
 
 const Session = require("../models/Session");
@@ -28,32 +37,7 @@ const { v4: uuidv4 } = require("uuid");
 const REENTRY_WINDOW_MS = 60 * 1000; // 60 seconds
 
 // C. Group Detection: entries within this window are considered a group
-const GROUP_WINDOW_MS = 1500; // 1.5 seconds
-
-// Minimum group size to stamp a group_id
-const GROUP_MIN_SIZE = 3;
-
-// ─── In-Memory Group Detection Buffer ────────────────────────────────────────
-// We hold a short rolling buffer of recent entry events (just session_ids and
-// timestamps). This is intentionally in-memory because:
-//   1. Group detection window is 1.5 s — far too short for a DB round-trip.
-//   2. The data is ephemeral — we only need it to stamp group_id, after which
-//      it is persisted in MongoDB.
-//   3. This is a single-process Node.js server — no distributed state issues.
-//
-// Buffer entry shape: { session_id: String, timestamp: Date }
-const recentEntryBuffer = [];
-
-/**
- * Prune entries older than GROUP_WINDOW_MS from the front of the buffer.
- * Call this before every group check to keep the buffer lean.
- */
-function pruneEntryBuffer(now) {
-  const cutoff = new Date(now.getTime() - GROUP_WINDOW_MS);
-  while (recentEntryBuffer.length > 0 && recentEntryBuffer[0].timestamp < cutoff) {
-    recentEntryBuffer.shift();
-  }
-}
+const GROUP_WINDOW_MS = 2000; // 2.0 seconds
 
 // ─── Helper: structured log ───────────────────────────────────────────────────
 function log(level, message, meta = {}) {
@@ -81,13 +65,14 @@ function log(level, message, meta = {}) {
  * session (e.g. a duplicate entry webhook), we append to it rather than
  * creating a second session.
  *
- * Rule C — Group Detection
- * ────────────────────────
- * After creating/reopening a session, push its session_id into the in-memory
- * buffer. If the buffer now holds ≥ GROUP_MIN_SIZE entries, all of them belong
- * to a group. Generate a UUID group_id and bulk-update all matching docs.
+ * Rule C — Group Detection (DB-based, 2.0s window)
+ * ───────────────────────────────────────────────
+ * After creating/reopening a session, query MongoDB for any other sessions
+ * created at the SAME store within the last 2.0 seconds. If a neighbour is
+ * found, they share a group_id (friends/family walking in together).
+ * This replaces the old in-memory buffer approach and survives server restarts.
  */
-async function handleEntry(payload, eventTimestamp) {
+async function handleEntry(payload, eventTimestamp, sessionId) {
   const { track_id, camera_id, zone_name } = payload;
 
   const timelineEntry = {
@@ -98,10 +83,11 @@ async function handleEntry(payload, eventTimestamp) {
     timestamp: eventTimestamp,
   };
 
-  // ── Check 1: Already-active session for this track_id ──────────────────
+  // ── Check 1: Already-active session for this track_id (current run only) ──
   let session = await Session.findOne({
     primary_track_id: track_id,
     status: "active",
+    run_session_id: sessionId,
   }).sort({ start_time: -1 });
 
   if (session) {
@@ -124,6 +110,7 @@ async function handleEntry(payload, eventTimestamp) {
     primary_track_id: track_id,
     status: "completed",
     end_time: { $gte: reentryWindowStart },
+    run_session_id: sessionId,
   }).sort({ end_time: -1 });
 
   if (recentlyClosed) {
@@ -140,9 +127,8 @@ async function handleEntry(payload, eventTimestamp) {
       original_end_time: recentlyClosed.end_time,
     });
 
-    // Re-entry counts for group detection too — push to buffer
-    pushToGroupBuffer(recentlyClosed.session_id, eventTimestamp);
-    await runGroupDetection(eventTimestamp);
+    // Re-entry counts for group detection too
+    await detectGroupWalkin(recentlyClosed, camera_id, eventTimestamp, sessionId);
 
     return recentlyClosed;
   }
@@ -153,6 +139,7 @@ async function handleEntry(payload, eventTimestamp) {
     start_time: eventTimestamp,
     status: "active",
     timeline: [timelineEntry],
+    run_session_id: sessionId,
   });
 
   await session.save();
@@ -162,9 +149,8 @@ async function handleEntry(payload, eventTimestamp) {
     track_id,
   });
 
-  // Group detection
-  pushToGroupBuffer(session.session_id, eventTimestamp);
-  await runGroupDetection(eventTimestamp);
+  // ── Group Detection (DB-based) ───────────────────────────────────
+  await detectGroupWalkin(session, camera_id, eventTimestamp, sessionId);
 
   return session;
 }
@@ -175,12 +161,13 @@ async function handleEntry(payload, eventTimestamp) {
  * We do NOT delete — completed sessions are the source of truth for
  * conversion rate calculations.
  */
-async function handleExit(payload, eventTimestamp) {
+async function handleExit(payload, eventTimestamp, sessionId) {
   const { track_id, camera_id, zone_name } = payload;
 
   const session = await Session.findOne({
     primary_track_id: track_id,
     status: "active",
+    run_session_id: sessionId,
   }).sort({ start_time: -1 });
 
   if (!session) {
@@ -235,11 +222,17 @@ async function handleExit(payload, eventTimestamp) {
  * centroids and use the last known position — but for this challenge, temporal
  * matching is both sufficient and explainable.
  */
-async function handleZoneEvent(payload, eventTimestamp) {
+async function handleZoneEvent(payload, eventTimestamp, sessionId) {
   const { track_id, camera_id, zone_name, event_type } = payload;
 
-  // Find the most recent active session — temporal proximity match
-  const session = await Session.findOne({ status: "active", is_staff: false })
+  // Find the most recent active session — temporal proximity match (current run only)
+  // NOTE: We intentionally do NOT filter by is_staff here. If a session has
+  // already been flagged as staff, it should keep absorbing zone events rather
+  // than cascading them to the next session (which would then also get flagged).
+  const session = await Session.findOne({
+    status: "active",
+    run_session_id: sessionId,
+  })
     .sort({ start_time: -1 });
 
   if (!session) {
@@ -274,50 +267,80 @@ async function handleZoneEvent(payload, eventTimestamp) {
   return session;
 }
 
-// ─── Group Detection Helpers ──────────────────────────────────────────────────
-
-function pushToGroupBuffer(session_id, timestamp) {
-  recentEntryBuffer.push({ session_id, timestamp });
-}
+// ─── Group Detection: DB-Based Temporal Query ──────────────────────────────
 
 /**
- * Rule C — Group Detection
- * ────────────────────────
- * After pruning stale entries from the buffer, if ≥ GROUP_MIN_SIZE entries
- * remain (all within GROUP_WINDOW_MS of each other), generate a UUID group_id
- * and bulk-stamp it on all matching Session documents.
+ * Rule C — Group Walk-in Detection
+ * ────────────────────────────────
+ * When a new entry event creates a session, query MongoDB for other sessions
+ * at the SAME store_id + SAME entry camera that were created within the last
+ * GROUP_WINDOW_MS (2.0 seconds). If any neighbours are found:
  *
- * A session that already has a group_id is not overwritten — this handles the
- * edge case where a 4th person joins a group that was already stamped.
+ *   Case A: Neighbour already has a group_id → copy it to the new session.
+ *   Case B: Neighbour has no group_id → generate a new UUID, stamp BOTH.
+ *
+ * This ensures friends/families entering together are counted as a single
+ * "buying unit" for conversion rate math.
+ *
+ * Why DB-based instead of in-memory:
+ *   - Survives server restarts and process crashes.
+ *   - Works in multi-process / clustered deployments.
+ *   - GROUP_WINDOW_MS is 2000ms — a single indexed MongoDB query takes <5ms,
+ *     so there's no latency concern.
  */
-async function runGroupDetection(now) {
-  pruneEntryBuffer(now);
+async function detectGroupWalkin(newSession, camera_id, eventTimestamp, runSessionId) {
+  const windowStart = new Date(eventTimestamp.getTime() - GROUP_WINDOW_MS);
 
-  if (recentEntryBuffer.length < GROUP_MIN_SIZE) return;
+  // Find any other session created at the same store within the 2s window
+  // Exclude the session we just created (by _id)
+  const neighbour = await Session.findOne({
+    _id: { $ne: newSession._id },
+    store_id: newSession.store_id,
+    run_session_id: runSessionId,
+    start_time: { $gte: windowStart, $lte: eventTimestamp },
+    // Only match sessions that entered via the same camera
+    "timeline.0.camera_id": camera_id,
+  }).sort({ start_time: -1 });
 
-  // Generate a single group_id for this cohort
-  const group_id = `grp_${uuidv4()}`;
+  if (!neighbour) return; // No temporal neighbour — solo walk-in
 
-  const session_ids = recentEntryBuffer.map((e) => e.session_id);
+  // Determine which group_id to use
+  let groupId;
 
-  const result = await Session.updateMany(
-    {
-      session_id: { $in: session_ids },
-      group_id: null, // don't overwrite an already-stamped group
-    },
-    { $set: { group_id } }
-  );
-
-  if (result.modifiedCount > 0) {
-    log("info", "Group detected — group_id stamped across sessions", {
-      group_id,
-      session_ids,
-      members_stamped: result.modifiedCount,
-    });
+  if (neighbour.group_id) {
+    // Case A: neighbour is already part of a group → join it
+    groupId = neighbour.group_id;
+  } else {
+    // Case B: neither has a group_id → create a new one, stamp both
+    groupId = `grp_${uuidv4()}`;
+    neighbour.group_id = groupId;
+    await neighbour.save();
   }
 
-  // Clear buffer — these sessions are now stamped, prevent re-processing
-  recentEntryBuffer.length = 0;
+  // Stamp the new session
+  newSession.group_id = groupId;
+  await newSession.save();
+
+  // Also stamp any OTHER sessions in this window that may not have the group_id yet
+  // (handles 3+ people entering together over multiple webhook firings)
+  await Session.updateMany(
+    {
+      _id: { $ne: newSession._id },
+      store_id: newSession.store_id,
+      run_session_id: runSessionId,
+      start_time: { $gte: windowStart, $lte: eventTimestamp },
+      "timeline.0.camera_id": camera_id,
+      group_id: null,
+    },
+    { $set: { group_id: groupId } }
+  );
+
+  log("info", "Group walk-in detected", {
+    group_id: groupId,
+    new_session_id: newSession.session_id,
+    neighbour_session_id: neighbour.session_id,
+    window_ms: GROUP_WINDOW_MS,
+  });
 }
 
 // ─── Main Route Handler ───────────────────────────────────────────────────────
@@ -335,6 +358,10 @@ async function runGroupDetection(now) {
 async function recordEvent(req, res) {
   try {
     const { event_type, camera_id, timestamp, track_id, zone_name } = req.body;
+
+    // ── Get Socket.io instance and run session_id from app.locals ─────────
+    const io = req.app.locals.io;
+    const runSessionId = req.app.locals.session_id;
 
     // ── Input Validation ──────────────────────────────────────────────────
     if (!event_type || !camera_id || !timestamp || track_id === undefined) {
@@ -368,17 +395,35 @@ async function recordEvent(req, res) {
 
     switch (event_type) {
       case "entry":
-        session = await handleEntry(req.body, eventTimestamp);
+        session = await handleEntry(req.body, eventTimestamp, runSessionId);
         break;
 
       case "exit":
-        session = await handleExit(req.body, eventTimestamp);
+        session = await handleExit(req.body, eventTimestamp, runSessionId);
         break;
 
       case "zone_dwell":
       case "billing_queue":
-        session = await handleZoneEvent(req.body, eventTimestamp);
+        session = await handleZoneEvent(req.body, eventTimestamp, runSessionId);
         break;
+    }
+
+    // ── WebSocket Push — broadcast live event to all dashboard clients ────
+    // This is the key: we push to the dashboard the INSTANT the DB is written.
+    // Dashboard does NOT need to poll — it reacts to this event immediately.
+    if (io && session) {
+      io.emit("live_event", {
+        event_type,
+        camera_id,
+        zone_name: zone_name || null,
+        track_id: parseInt(track_id),
+        session_id: session.session_id,
+        session_status: session.status,
+        is_staff: session.is_staff,
+        group_id: session.group_id || null,
+        timestamp: eventTimestamp.toISOString(),
+        run_session_id: runSessionId,
+      });
     }
 
     // ── Response ──────────────────────────────────────────────────────────
