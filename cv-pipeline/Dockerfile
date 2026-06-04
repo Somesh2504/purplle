@@ -36,4 +36,4 @@ RUN mkdir -p /app/data/videos
 # No exposed port — this is a pure worker container.
 # It only makes outbound HTTP calls to the backend service.
 
-CMD ["python", "-u", "tracker.py"]
+CMD ["bash", "-c", "python download_data.py && python -u tracker.py"]

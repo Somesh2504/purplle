@@ -30,7 +30,7 @@ const RETRY_INTERVAL_MS = 5000;
 // are scoped to this ID — so old data from
 // previous runs is never mixed with live data.
 // ─────────────────────────────────────────────
-const SESSION_ID = `session_${new Date().toISOString().replace(/[:.]/g, "-")}`;
+const SESSION_ID = process.env.NODE_ENV === "production" ? "hackathon_live_demo" : `session_${new Date().toISOString().replace(/[:.]/g, "-")}`;
 
 console.log(
   JSON.stringify({
