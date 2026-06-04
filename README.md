@@ -86,21 +86,72 @@ docker-compose down
 
 ---
 
-## Architecture Overview
+# System Architecture & Data Flow
 
-```
-cv-pipeline (Python)  ──POST /api/events──▶  backend (Node.js)  ──▶  MongoDB Atlas
-     │                                              │
-     │ reads                                        │ reads
-     ▼                                              ▼
- data/videos/*.mp4                         data/*.csv (POS data)
-```
+## 📌 Executive Summary
+This Store Intelligence System is designed with an **Event-Driven, Edge-to-Cloud Microservices Architecture**. 
 
-| Service | Role |
-|---|---|
-| `cv-pipeline` | YOLOv8n detection + spatial event emission |
-| `backend` | Session state machine + business logic API |
-| `mongodb` | Persistent session storage |
+Rather than relying on monolithic, computationally heavy Deep Learning models that attempt to track a single visual identity across multiple cameras (which requires massive GPU clusters and fails under real-world occlusion), this system implements a **Session-Based Temporal Strategy**. 
+
+We utilize lightweight, edge-optimized Computer Vision (YOLOv8 Nano) to generate atomic spatial events, and push the heavy lifting of state-management and customer journey mapping to a robust Node.js/MongoDB backend. This makes the system incredibly resilient, horizontally scalable, and capable of running on standard store hardware (CPUs).
+
+---
+
+## 🌊 The End-to-End Data Lifecycle
+
+### Phase 1: Physical Ingestion (The Edge)
+1. **The CCTV Feeds:** The system ingests raw RTSP streams or standard `.mp4` video files from multiple cameras (e.g., `entry_cam`, `zone_1`, `billing`). 
+2. **Frame Optimization:** To ensure the system can run on a standard in-store computer without lagging, the OpenCV pipeline implements an aggressive **1-in-5 frame-skipping algorithm**. Because human walking speeds in a retail environment are relatively slow, skipping frames reduces CPU overhead by 80% with zero loss in business intelligence accuracy.
+
+### Phase 2: Spatial Processing (The AI Layer)
+1. **Object Detection & Local Tracking:** For every processed frame, YOLOv8n detects human bounding boxes. We utilize the `ByteTrack` algorithm (`persist=True`) to maintain a local `track_id` for each person *within that specific camera's view*.
+2. **Virtual Boundaries:** We project mathematical boundaries onto the 2D video frames based on the store's physical floor plan:
+   * **Entry Vectors:** A straight line drawn across the store entrance. If a bounding box crosses this vector, the system calculates the trajectory to determine if it is an "Entry" or "Exit".
+   * **Dwell Polygons:** Custom multi-point polygons drawn over key areas (e.g., Makeup Unit, Cash Counter). If a person's center-point remains inside this polygon for >9 seconds, it triggers a "Dwell".
+
+### Phase 3: Event Decoupling (The Webhook)
+The Python Vision service is entirely stateless. The moment a boundary rule is triggered, it fires an asynchronous, non-blocking HTTP POST webhook to the backend API.
+* **Sample Payload:** `{ "store_id": "store_1", "camera_id": "zone_1", "event_type": "zone_dwell", "track_id": 42, "timestamp": "2026-04-10T16:55:36Z" }`
+
+### Phase 4: State Management & Heuristics (The Brain)
+The Node.js/Express backend receives this continuous stream of atomic events and uses **Temporal Clustering Logic** to stitch them into unified `Customer Session` documents in MongoDB. 
+
+Instead of relying on AI to match faces (which poses privacy/GDPR risks and requires GPUs), our backend uses time-based rules to map the customer journey.
+
+---
+
+## ⚙️ How We Handle Complex Real-World Edge Cases
+
+The true power of this architecture lies in the backend heuristics used to clean the data and prevent metric corruption.
+
+### 1. Group Tracking (The "Buying Unit" Problem)
+* **The Problem:** A family of 4 walks in together. YOLO detects 4 people. If counted as 4 separate shoppers, our conversion rate will be artificially crushed when they only generate 1 invoice at the register.
+* **The Solution (Temporal Clustering):** When the backend receives multiple `entry` events from the exact same `store_id` and `camera_id` within a **1.5-second rolling time window**, the database assigns all of them a shared `group_id`. Our `/metrics` API then groups these sessions together, treating the family correctly as a single "Buying Unit".
+
+### 2. The Re-Entry Problem
+* **The Problem:** A customer walks outside to take a phone call and walks back in 30 seconds later.
+* **The Solution:** When an `entry` event is fired, the Node.js controller queries MongoDB for any recent `exit` event matching that exact `track_id` from the entry camera within the last 60 seconds. If found, the API reopens the existing session rather than creating a duplicate top-of-funnel walk-in.
+
+### 3. Staff Filtering
+* **The Problem:** Store employees walk past the cameras all day.
+* **The Solution:** We apply a duration and frequency threshold. If a Session document remains "active" for more than 4 continuous hours, or if the document logs more than 15 unique `zone_dwell` events hopping rapidly between areas, the backend automatically flags the document with `is_staff: true`. These sessions are automatically excluded from the final Conversion Rate calculations.
+
+---
+
+## 📊 Business Intelligence & Conversion (The Output)
+
+The final phase unites the physical tracking data with the digital POS (Point of Sale) data.
+
+1. **POS Ingestion:** The system parses the provided transaction CSV (`Brigade_Bangalore_10_April_26.csv`) to determine the exact number of unique checkout invoices generated for the day.
+2. **The Funnel API (`/api/funnel`):** The backend queries MongoDB to aggregate the customer journey:
+   * **Level 1 (Walk-ins):** Total valid consumer sessions.
+   * **Level 2 (Engagement):** Sessions containing at least one `zone_dwell`.
+   * **Level 3 (Checkout Ready):** Sessions containing a `billing_queue` event.
+   * **Level 4 (Converted):** Total unique invoices from the POS data.
+3. **The Metrics API (`/api/metrics`):** Calculates the definitive **Store Conversion Rate** `(Total Invoices / Total Valid Buying Units) * 100` and runs statistical anomaly checks (e.g., flagging the dashboard if walk-ins exceed 300 but conversion drops below 1%).
+
+### 🚀 Conclusion
+By decoupling the heavy visual processing from the business logic, this system is inherently modular. A store can add 10 more cameras simply by running more lightweight Python edge scripts, and the centralized backend will seamlessly ingest and map the new spatial data without requiring any architectural rewrites.
 
 See [`DESIGN.md`](./DESIGN.md) for the full architecture document.
 See [`CHOICES.md`](./CHOICES.md) for engineering decision rationale.
