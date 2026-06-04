@@ -17,9 +17,9 @@ An end-to-end AI-powered retail analytics system that processes CCTV footage to 
 
 ---
 
-## Quick Start (Native Windows Setup)
+## Quick Start (One-Click Deployment)
 
-We have transitioned away from Docker to provide a faster, native execution environment on Windows using PowerShell. 
+The system is fully containerized and runs flawlessly via Docker Compose, fulfilling the mandatory acceptance gate for a single-command setup.
 
 ### 1. Clone and place data files
 
@@ -47,30 +47,24 @@ The system uses a cloud-hosted MongoDB Atlas cluster for data persistence.
 4. Click **ALLOW ACCESS FROM ANYWHERE** (this will fill in `0.0.0.0/0`) or add your current IP.
 5. Click **Confirm** and wait ~30 seconds for the status to turn "Active".
 
-### 3. Install Dependencies
+### 3. Start the system via Docker
 
-Open PowerShell and run the setup script to install all Node and Python dependencies:
+Run the standard docker-compose command from the root of the project:
 
-```powershell
-.\setup.ps1
+```bash
+docker-compose up --build
 ```
 
-### 4. Start the system
+This command will simultaneously spin up:
+- The MongoDB instance.
+- The Node.js backend.
+- The Python CV pipeline.
 
-Run the main orchestration script:
+*(Note: If you prefer native Windows execution without Docker, you can run `.\setup.ps1` followed by `.\start_system.ps1` in PowerShell.)*
 
-```powershell
-.\start_system.ps1
-```
+### 4. Verify the system is running
 
-This script will:
-- Boot up the Node.js backend on port 3000.
-- Wait for it to connect to MongoDB Atlas and become healthy.
-- Launch the Python CV pipeline to begin analyzing the videos and pushing events.
-
-### 5. Verify the system is running
-
-Open a **new** PowerShell window and test the endpoints:
+Open a **new** terminal window and test the endpoints:
 
 ```powershell
 # Health check (should return 200 OK with database: "connected")
@@ -83,9 +77,12 @@ curl.exe http://localhost:3000/api/metrics
 curl.exe http://localhost:3000/api/funnel
 ```
 
-### 6. Stop
+### 5. Stop
 
-To stop all services, simply press **ENTER** in the terminal running `start_system.ps1`, or press `Ctrl+C`.
+To stop all services, press `Ctrl+C` in the terminal running docker-compose, or run:
+```bash
+docker-compose down
+```
 
 ---
 
@@ -109,6 +106,17 @@ See [`DESIGN.md`](./DESIGN.md) for the full architecture document.
 See [`CHOICES.md`](./CHOICES.md) for engineering decision rationale.
 
 ---
+
+## Testing
+
+Basic tests are provided to verify the complex "Buying Unit" mathematical logic inside the Metrics Controller, including the empty CSV edge case.
+
+To run the tests natively:
+```bash
+cd backend
+npm install
+npm test
+```
 
 ## API Reference
 
@@ -218,8 +226,9 @@ Configuration is handled via the `.env` file in the `backend/` directory and var
 
 ```
 purplle-tech-challenge/
-├── setup.ps1                   # Dependency installation script
-├── start_system.ps1            # Main execution orchestrator
+├── docker-compose.yml          # Mandatory one-click deployment
+├── setup.ps1                   # Alternative local setup script
+├── start_system.ps1            # Alternative local execution
 ├── DESIGN.md                   # Architecture document
 ├── CHOICES.md                  # Engineering decisions
 ├── README.md                   # This file
@@ -242,10 +251,12 @@ purplle-tech-challenge/
 │   ├── controllers/
 │   │   ├── eventController.js  # State machine logic
 │   │   └── metricsController.js# KPI + funnel computation
-│   └── routes/
-│       ├── events.js
-│       ├── metrics.js
-│       └── funnel.js
+│   ├── routes/
+│   │   ├── events.js
+│   │   ├── metrics.js
+│   │   └── funnel.js
+│   └── tests/
+│       └── metrics.test.js     # Jest unit tests
 │
 └── cv-pipeline/
     ├── requirements.txt
